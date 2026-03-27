@@ -31,10 +31,17 @@ assert max_off_diag < 1e-5, "Rotation matrix is not orthogonal!"
 # --- Lloyd-Max codebook for approximately Gaussian distribution ---
 # After rotation by a random orthogonal matrix, each coordinate of a
 # high-dimensional vector converges to approximately N(0, sigma^2).
-# sigma depends on the typical magnitude of KV cache vectors.
-# We use sigma=0.1 which covers the typical range well for transformer KV caches.
-# The codebook can be regenerated with a different sigma if runtime stats show mismatch.
-SIGMA = 0.1
+#
+# For unit-normalized vectors in d=64 dimensions (L2 norm = 1.0):
+#   E[x_i^2] = 1/d = 1/64
+#   per-coordinate sigma = sqrt(1/64) = 0.125
+#
+# Using sigma=0.15 to provide a safety margin for distribution tails.
+# Prior sigma=0.1 was 25% too narrow, causing ~5-6% of coordinates to
+# clip to edge levels with ~45% relative quantization error.
+# This mismatch caused value vector corruption (60% relative error) that
+# accumulated over ~38 decode steps, producing token 0 repetition.
+SIGMA = 0.15
 
 
 def lloyd_max_gaussian(num_levels, sigma, iterations=200):

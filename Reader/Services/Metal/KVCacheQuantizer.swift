@@ -174,6 +174,9 @@ final class KVCacheQuantizer {
 
     // MARK: - Public API
 
+    // Track step count for diagnostic logging
+    private var stepCount: Int = 0
+
     /// Extract and compress ONLY the new token position from this step's `present` output.
     ///
     /// The `present` tensor has shape [1, numHeads, seqLen, headDim] in fp16.
@@ -194,9 +197,27 @@ final class KVCacheQuantizer {
         let newKeyVecs = extractLastPosition(from: keyData, seqLen: seqLen)
         let newValVecs = extractLastPosition(from: valData, seqLen: seqLen)
 
+        // DIAGNOSTIC: Log extracted data before quantization (steps 32-48)
+        if stepCount >= 32 && stepCount <= 48 && layerIndex == 0 {
+            let newKeyVecsFloat = newKeyVecs.withUnsafeBytes { ptr -> [Float] in
+                let buf = ptr.bindMemory(to: Float.self)
+                return Array(buf.prefix(min(4, buf.count)))
+            }
+            let newValVecsFloat = newValVecs.withUnsafeBytes { ptr -> [Float] in
+                let buf = ptr.bindMemory(to: Float.self)
+                return Array(buf.prefix(min(4, buf.count)))
+            }
+            kvqLogger.warning("PQ_COMPRESS step=\(self.stepCount) layer=0 seqLen=\(seqLen) keyDataCount=\(keyData.count) newKeyVecsCount=\(newKeyVecs.count) newValVecsCount=\(newValVecs.count) keyFirst4=[\(newKeyVecsFloat.map { String(format: "%.4f", $0) }.joined(separator: ","))] valFirst4=[\(newValVecsFloat.map { String(format: "%.4f", $0) }.joined(separator: ","))]")
+        }
+
         // Quantize the new vectors on GPU
         let compressedKey = try quantizeVectors(newKeyVecs)
         let compressedVal = try quantizeVectors(newValVecs)
+
+        // DIAGNOSTIC: Log compressed sizes after quantization (steps 36-42)
+        if stepCount >= 32 && stepCount <= 48 && layerIndex == 0 {
+            kvqLogger.warning("PQ_COMPRESSED step=\(self.stepCount) layer=0 keyIndicesCount=\(compressedKey.indices.count) keyScalesCount=\(compressedKey.scales.count) valIndicesCount=\(compressedVal.indices.count) valScalesCount=\(compressedVal.scales.count) storeSeqLenBeforeAppend=\(self.compressedKeys[layerIndex].seqLen)")
+        }
 
         // Append to growing store
         compressedKeys[layerIndex].indicesData.append(compressedKey.indices)
@@ -206,6 +227,14 @@ final class KVCacheQuantizer {
         compressedValues[layerIndex].indicesData.append(compressedVal.indices)
         compressedValues[layerIndex].scalesData.append(compressedVal.scales)
         compressedValues[layerIndex].seqLen = seqLen
+
+        // DIAGNOSTIC: Log store state after append (steps 36-42)
+        if stepCount >= 32 && stepCount <= 48 && layerIndex == 0 {
+            let store = self.compressedKeys[layerIndex]
+            kvqLogger.warning("PQ_STORE_AFTER_COMPRESS step=\(self.stepCount) layer=0 indicesDataTotal=\(store.indicesData.count) scalesDataTotal=\(store.scalesData.count) seqLen=\(store.seqLen) expectedIndices=\(store.seqLen * self.numHeads * self.packedPerVec * 2) expectedScales=\(store.seqLen * self.numHeads * 2)")
+        }
+
+        stepCount += 1
     }
 
     /// Decompress a layer's full key cache to fp16 ORTValue.
@@ -215,6 +244,31 @@ final class KVCacheQuantizer {
             return try makeEmptyKVTensor()
         }
         let fp16Data = try dequantizeStore(store: store)
+
+        // DIAGNOSTIC: Log decompressed data (steps 35-45)
+        // NOTE: stepCount is already incremented to NEXT step, so this logs step+1
+        // when decompressing. Use storeSeqLen to correlate with compress step.
+        if stepCount >= 32 && stepCount <= 48 && layerIndex == 0 {
+            // Print first 4 fp16 bytes as hex
+            var first4Hex: [String] = []
+            fp16Data.prefix(8).withUnsafeBytes { ptr in
+                let buf = ptr.bindMemory(to: UInt16.self)
+                for i in 0..<min(buf.count, 4) {
+                    first4Hex.append(String(format: "0x%04X", buf[i]))
+                }
+            }
+            // Check for NaN/Inf in first 512 fp16 elements
+            var nanInfCount = 0
+            fp16Data.prefix(1024).withUnsafeBytes { ptr in
+                let buf = ptr.bindMemory(to: UInt16.self)
+                for i in 0..<min(buf.count, 512) {
+                    let exp = (buf[i] & 0x7C00) >> 10
+                    if exp == 31 { nanInfCount += 1 }  // Infinity or NaN
+                }
+            }
+            kvqLogger.warning("PQ_DECOMPRESS loggingStep=\(self.stepCount) actualSeqLen=\(store.seqLen) layer=0 fp16DataCount=\(fp16Data.count) expected=\(self.numHeads * store.seqLen * self.headDim * 2) first4Fp16=[\(first4Hex.joined(separator: ","))] nanInfCount=\(nanInfCount)")
+        }
+
         return try makeFloat16ORTValue(
             data: fp16Data,
             shape: [1, NSNumber(value: numHeads), NSNumber(value: store.seqLen), NSNumber(value: headDim)]
@@ -240,6 +294,7 @@ final class KVCacheQuantizer {
             compressedKeys[i] = CompressedStore(indicesData: Data(), scalesData: Data(), seqLen: 0)
             compressedValues[i] = CompressedStore(indicesData: Data(), scalesData: Data(), seqLen: 0)
         }
+        stepCount = 0
         kvqLogger.debug("KV cache quantizer reset")
     }
 
@@ -307,7 +362,7 @@ final class KVCacheQuantizer {
         let numVecs = numHeads
 
         // Copy input to scratch buffer
-        fp16Data.withUnsafeBytes { ptr in
+        _ = fp16Data.withUnsafeBytes { ptr in
             memcpy(scratchInputBuffer.contents(), ptr.baseAddress!, fp16Data.count)
         }
 
@@ -348,6 +403,23 @@ final class KVCacheQuantizer {
         let indicesData = Data(bytes: scratchIndicesBuffer.contents(), count: indicesSize)
         let scalesData = Data(bytes: scratchScalesBuffer.contents(), count: scalesSize)
 
+        // DIAGNOSTIC: Log scales (steps 35-45) — these are per-vector norms and should be positive
+        if stepCount >= 32 && stepCount <= 48 && numVecs <= 16 {
+            // Print scale bytes as fp16 hex (each scale is 2 bytes fp16)
+            var scaleHex: [String] = []
+            scalesData.withUnsafeBytes { ptr in
+                let buf = ptr.bindMemory(to: UInt16.self)
+                for i in 0..<min(Int(numVecs), 8) {
+                    scaleHex.append(String(format: "0x%04X", buf[i]))
+                }
+            }
+            let zeroScales = scalesData.withUnsafeBytes { ptr -> Int in
+                let buf = ptr.bindMemory(to: UInt16.self)
+                return buf.filter { $0 == 0 }.count
+            }
+            kvqLogger.warning("PQ_QUANT_SCALAR step=\(self.stepCount) numVecs=\(numVecs) scaleHex=[\(scaleHex.joined(separator: ","))] zeroScales=\(zeroScales)")
+        }
+
         return QuantizedChunk(indices: indicesData, scales: scalesData)
     }
 
@@ -387,6 +459,8 @@ final class KVCacheQuantizer {
 
         var totalVecs = UInt32(numVecs)
         encoder.setBytes(&totalVecs, length: MemoryLayout<UInt32>.size, index: 5)
+        var numHeadsValue = UInt32(numHeads)
+        encoder.setBytes(&numHeadsValue, length: MemoryLayout<UInt32>.size, index: 6)
 
         let tgWidth = min(dequantizePSO.maxTotalThreadsPerThreadgroup, 256)
         encoder.dispatchThreads(
@@ -403,47 +477,22 @@ final class KVCacheQuantizer {
             throw KVQError.metalCommandFailed
         }
 
-        // The output is [numHeads * seqLen, headDim] in fp16, laid out as
-        // head0_pos0, head0_pos1, ..., head0_posN, head1_pos0, ...
-        // But ORT expects [1, numHeads, seqLen, headDim] which is the same layout.
-        // Wait — our compressed store appends per-step: [h0_p0, h1_p0, ..., h0_p1, h1_p1, ...]
-        // But ORT expects: [h0_p0, h0_p1, ..., h1_p0, h1_p1, ...]
-        // We need to transpose! Let's do it on CPU (it's just memory copies).
+        // GPU now outputs directly in ORT-order [head*seqLen + step], no transpose needed
+        let rawOutput = Data(bytes: outputBuffer.contents(), count: outputSize)
 
-        return transposeToORTLayout(
-            from: Data(bytes: outputBuffer.contents(), count: outputSize),
-            numHeads: numHeads,
-            seqLen: store.seqLen,
-            headDim: headDim
-        )
-    }
-
-    /// Transpose from append-order [step, head, headDim] to ORT order [head, step, headDim].
-    ///
-    /// Append order (how we stored it):  step0_head0, step0_head1, ..., step1_head0, ...
-    /// ORT order:                        head0_step0, head0_step1, ..., head1_step0, ...
-    private func transposeToORTLayout(from data: Data, numHeads: Int, seqLen: Int, headDim: Int) -> Data {
-        let bytesPerVec = headDim * 2  // fp16
-        var result = Data(count: data.count)
-
-        data.withUnsafeBytes { srcPtr in
-            result.withUnsafeMutableBytes { dstPtr in
-                let src = srcPtr.baseAddress!
-                let dst = dstPtr.baseAddress!
-
-                for step in 0..<seqLen {
-                    for head in 0..<numHeads {
-                        // Source: step * numHeads + head
-                        let srcOffset = (step * numHeads + head) * bytesPerVec
-                        // Dest: head * seqLen + step
-                        let dstOffset = (head * seqLen + step) * bytesPerVec
-                        memcpy(dst.advanced(by: dstOffset), src.advanced(by: srcOffset), bytesPerVec)
-                    }
+        // DIAGNOSTIC: Log GPU dequantize output (steps 35-45)
+        if stepCount >= 32 && stepCount <= 48 && (numHeads * store.seqLen) <= 256 {
+            var rawFirst4: [String] = []
+            rawOutput.prefix(8).withUnsafeBytes { ptr in
+                let buf = ptr.bindMemory(to: UInt16.self)
+                for i in 0..<min(buf.count, 4) {
+                    rawFirst4.append(String(format: "0x%04X", buf[i]))
                 }
             }
+            kvqLogger.warning("PQ_DEQUANT_RAW step=\(self.stepCount) numVecs=\(numVecs) rawOutputSize=\(rawOutput.count) expected=\(outputSize) first4Fp16=[\(rawFirst4.joined(separator: ","))]")
         }
 
-        return result
+        return rawOutput
     }
 
     // MARK: - Helpers

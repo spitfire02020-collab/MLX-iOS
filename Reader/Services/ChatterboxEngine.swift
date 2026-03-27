@@ -1185,8 +1185,68 @@ final class ChatterboxEngine: ObservableObject {
                     }
                     // Decompress full cache from single-quantized store
                     for layer in 0..<numLayers {
-                        nextStepInputs["past_key_values.\(layer).key"] = try quantizer.decompressKey(layerIndex: layer)
-                        nextStepInputs["past_key_values.\(layer).value"] = try quantizer.decompressValue(layerIndex: layer)
+                        let decompressedKey = try quantizer.decompressKey(layerIndex: layer)
+                        let decompressedValue = try quantizer.decompressValue(layerIndex: layer)
+                        nextStepInputs["past_key_values.\(layer).key"] = decompressedKey
+                        nextStepInputs["past_key_values.\(layer).value"] = decompressedValue
+
+                        // DIAGNOSTIC: Log decompressed KV bytes directly from engine (bypasses KVCacheQuantizer logger)
+                        // decompressKey is called at the START of each decode step, so 'step' here is the step
+                        // whose compressed KV we're decompressing. Repetition DETECTED at step 38, but corruption
+                        // likely starts ~6 steps earlier (REPETITION DETECTED checks 6 tokens back).
+                        if step >= 32 && step <= 48 && layer == 0 {
+                            if let keyData = try? decompressedKey.tensorData() as Data,
+                               let valData = try? decompressedValue.tensorData() as Data {
+                                // Check for NaN/Inf in more fp16 values (first 16 vectors = 16 * 64 = 1024 bytes)
+                                var keyNanCount = 0
+                                var keyZeroCount = 0
+                                var keyInfCount = 0
+                                let keySlice = keyData.prefix(1024)
+                                keySlice.withUnsafeBytes { ptr in
+                                    let buf = ptr.bindMemory(to: UInt16.self)
+                                    for i in 0..<min(buf.count, 512) {
+                                        let exp = (buf[i] & 0x7C00) >> 10
+                                        if exp == 31 { keyInfCount += 1 }  // Infinity
+                                        if exp == 31 && (buf[i] & 0x03FF) != 0 { keyNanCount += 1 }  // NaN
+                                        if buf[i] == 0 { keyZeroCount += 1 }
+                                    }
+                                }
+                                var valNanCount = 0
+                                var valZeroCount = 0
+                                var valInfCount = 0
+                                let valSlice = valData.prefix(1024)
+                                valSlice.withUnsafeBytes { ptr in
+                                    let buf = ptr.bindMemory(to: UInt16.self)
+                                    for i in 0..<min(buf.count, 512) {
+                                        let exp = (buf[i] & 0x7C00) >> 10
+                                        if exp == 31 { valInfCount += 1 }  // Infinity
+                                        if exp == 31 && (buf[i] & 0x03FF) != 0 { valNanCount += 1 }  // NaN
+                                        if buf[i] == 0 { valZeroCount += 1 }
+                                    }
+                                }
+                                let keyInfo = (try? decompressedKey.tensorTypeAndShapeInfo())?.shape ?? []
+                                let valInfo = (try? decompressedValue.tensorTypeAndShapeInfo())?.shape ?? []
+                                // Show actual fp16 bytes as UInt16 hex for first 4 values (head 0, step 0)
+                                var keyFirst4: [String] = []
+                                var valFirst4: [String] = []
+                                keyData.prefix(8).withUnsafeBytes { ptr in
+                                    let buf = ptr.bindMemory(to: UInt16.self)
+                                    for i in 0..<min(buf.count, 4) {
+                                        keyFirst4.append(String(format: "0x%04X", buf[i]))
+                                    }
+                                }
+                                valData.prefix(8).withUnsafeBytes { ptr in
+                                    let buf = ptr.bindMemory(to: UInt16.self)
+                                    for i in 0..<min(buf.count, 4) {
+                                        valFirst4.append(String(format: "0x%04X", buf[i]))
+                                    }
+                                }
+                                // Expected bytes: 1 * 16 * seqLen * 64 * 2 = 32 * seqLen
+                                let seqLen = keyInfo.count >= 3 ? keyInfo[2].intValue : 0
+                                let expectedBytes = 32 * seqLen
+                                chatterboxLogger.warning("PQ_ENGINE_DECOMPRESS step=\(step) layer=0 keyShape=\(keyInfo) keyBytes=\(keyData.count)/exp\(expectedBytes) keyNaN=\(keyNanCount) keyInf=\(keyInfCount) keyZero=\(keyZeroCount) valShape=\(valInfo) valBytes=\(valData.count) valNaN=\(valNanCount) valInf=\(valInfCount) valZero=\(valZeroCount) keyFirst4=\(keyFirst4) valFirst4=\(valFirst4)")
+                            }
+                        }
                     }
 
                     // Log compression stats every 100 steps

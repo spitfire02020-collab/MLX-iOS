@@ -90,12 +90,20 @@ kernel void polarquant_quantize(
 // ── Dequantize: 4-bit packed → fp16 ───────────────────────────────────────
 //
 // Buffers:
-//   [0] input:     uint16[total_vecs * 16]   — packed 4-bit indices
-//   [1] scales:    half[total_vecs]           — per-vector L2 norm
-//   [2] output:    half[total_vecs * 64]      — reconstructed fp16
+//   [0] input:     uint16[total_vecs * 16]   — packed 4-bit indices (APPEND-order)
+//   [1] scales:    half[total_vecs]           — per-vector L2 norm (APPEND-order)
+//   [2] output:    half[total_vecs * 64]      — reconstructed fp16 (ORT-order)
 //   [3] rotation:  float[64 * 64]            — R^T (transposed rotation)
 //   [4] centroids: float[16]                 — Lloyd-Max reconstruction values
 //   [5] total_vecs: uint                     — number of vectors to process
+//   [6] num_heads: uint                     — number of attention heads
+//
+// APPEND-order layout: [step0_h0, step0_h1, ..., step0_hN, step1_h0, ...]
+// ORT-order layout:    [h0_s0, h0_s1, ..., h1_s0, h1_s1, ...]
+//
+// Kernel dispatch: 1D grid of [numHeads * seqLen] threads.
+// Thread gid maps to ORT position: gid = head * seqLen + step.
+// We must read from APPEND position:  step * numHeads + head.
 
 kernel void polarquant_dequantize(
     device const uint16_t*   input       [[buffer(0)]],
@@ -104,13 +112,19 @@ kernel void polarquant_dequantize(
     constant float*          rotation_t  [[buffer(3)]],
     constant float*          centroids   [[buffer(4)]],
     constant uint&           total_vecs  [[buffer(5)]],
+    constant uint&           num_heads   [[buffer(6)]],
     uint                     gid         [[thread_position_in_grid]])
 {
     if (gid >= total_vecs) return;
 
-    // ── Unpack 4-bit indices and look up centroids ──
+    // Decode ORT position (gid = head * seqLen + step) to get head and step
+    const uint head = gid / num_heads;
+    const uint step = gid % num_heads;
+
+    // ── Read from APPEND-order compressed store ──
+    // APPEND position for this (step, head): step * numHeads + head
     float rotated[HEAD_DIM];
-    const int in_base = gid * PACKED_PER_VEC;
+    const int in_base = (step * num_heads + head) * PACKED_PER_VEC;
 
     for (int group = 0; group < PACKED_PER_VEC; group++) {
         const uint16_t packed = input[in_base + group];
@@ -131,8 +145,8 @@ kernel void polarquant_dequantize(
         vec[i] = sum;
     }
 
-    // ── Rescale and write fp16 output ──
-    const float scale = float(scales_buf[gid]);
+    // ── Rescale and write fp16 output (already in ORT-order at gid) ──
+    const float scale = float(scales_buf[step * num_heads + head]);
     const int out_base = gid * HEAD_DIM;
     for (int i = 0; i < HEAD_DIM; i++) {
         output[out_base + i] = half(vec[i] * scale);
