@@ -1174,16 +1174,16 @@ final class ChatterboxEngine: ObservableObject {
                 ]
 
                 // Carry KV-cache forward, optionally compressing via PolarQuant.
-                // When enabled, KV cache is stored at 4-bit between steps (~3.6x smaller).
+                // INCREMENTAL: only quantize the NEW position each step (no compounding error).
                 if let quantizer = self.kvCacheQuantizer, quantizer.isEnabled {
-                    // Compress this step's full KV cache on Metal GPU
+                    // Quantize ONLY the new token's KV vectors (last position in present)
                     for layer in 0..<numLayers {
                         if let key = lmOutputs["present.\(layer).key"],
                            let val = lmOutputs["present.\(layer).value"] {
-                            try quantizer.compress(layerIndex: layer, key: key, value: val)
+                            try quantizer.compressNewPosition(layerIndex: layer, key: key, value: val)
                         }
                     }
-                    // Decompress for next step's input (fp16 ORTValues)
+                    // Decompress full cache from single-quantized store
                     for layer in 0..<numLayers {
                         nextStepInputs["past_key_values.\(layer).key"] = try quantizer.decompressKey(layerIndex: layer)
                         nextStepInputs["past_key_values.\(layer).value"] = try quantizer.decompressValue(layerIndex: layer)

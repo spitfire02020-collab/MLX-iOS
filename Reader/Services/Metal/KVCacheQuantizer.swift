@@ -29,23 +29,14 @@ enum KVQError: Error, LocalizedError {
 
 /// PolarQuant 4-bit KV cache compressor using Metal GPU.
 ///
-/// Compresses KV cache tensors from fp16 → 4-bit between decode steps,
-/// reducing memory by ~3.6x. Reconstructs fp16 ORTValues for ORT input.
+/// **Incremental** quantization: each KV position is quantized exactly ONCE when
+/// it first appears (as the last position in `present.{layer}.key/value`).
+/// Subsequent steps dequantize from this single-quantized store, avoiding
+/// compounding quantization error.
 ///
-/// Usage in decode loop:
-/// ```
-/// // After LM step — compress
-/// for layer in 0..<numLayers {
-///     try quantizer.compress(layerIndex: layer,
-///                            key: outputs["present.\(layer).key"]!,
-///                            value: outputs["present.\(layer).value"]!)
-/// }
-/// // Before next step — decompress
-/// for layer in 0..<numLayers {
-///     inputs["past_key_values.\(layer).key"]   = try quantizer.decompressKey(layerIndex: layer)
-///     inputs["past_key_values.\(layer).value"] = try quantizer.decompressValue(layerIndex: layer)
-/// }
-/// ```
+/// Memory layout per layer:
+///   - packed indices: growing buffer of 4-bit packed uint16  [numHeads * seqLen * (headDim/4)]
+///   - scales:         growing buffer of fp16 per-vector norms [numHeads * seqLen]
 final class KVCacheQuantizer {
 
     // MARK: - Metal State
@@ -67,21 +58,29 @@ final class KVCacheQuantizer {
     let numLayers: Int
     let numHeads: Int
     let headDim: Int
+    private let packedPerVec: Int   // headDim / 4
 
     /// Toggle for A/B testing. When false, compress/decompress are no-ops.
     var isEnabled: Bool = true
 
-    // MARK: - Compressed Storage
+    // MARK: - Incremental Compressed Storage
 
-    /// Per-layer compressed key/value data.
-    private struct CompressedEntry {
-        var indices: MTLBuffer   // packed 4-bit uint16  [numVecs * (headDim/4)]
-        var scales: MTLBuffer    // per-vector norm fp16  [numVecs]
-        var numVecs: Int         // numHeads * seqLen
+    /// Per-layer growing compressed store.
+    /// Each step appends `numHeads` new vectors (one per head for the new token position).
+    private struct CompressedStore {
+        var indicesData: Data    // packed 4-bit uint16, grows by numHeads * packedPerVec * 2 bytes per step
+        var scalesData: Data     // per-vector norm fp16, grows by numHeads * 2 bytes per step
+        var seqLen: Int          // number of token positions stored
     }
 
-    private var compressedKeys: [CompressedEntry]
-    private var compressedValues: [CompressedEntry]
+    private var compressedKeys: [CompressedStore]
+    private var compressedValues: [CompressedStore]
+
+    // Pre-allocated scratch buffer for quantizing one step's new vectors
+    // (numHeads vectors per layer)
+    private var scratchInputBuffer: MTLBuffer
+    private var scratchIndicesBuffer: MTLBuffer
+    private var scratchScalesBuffer: MTLBuffer
 
     // MARK: - Init
 
@@ -98,6 +97,7 @@ final class KVCacheQuantizer {
         self.numLayers = numLayers
         self.numHeads = numHeads
         self.headDim = headDim
+        self.packedPerVec = headDim / 4
 
         // ── Load Metal shaders ──
         guard let library = device.makeDefaultLibrary(),
@@ -149,62 +149,96 @@ final class KVCacheQuantizer {
             options: .storageModeShared
         )!
 
-        // ── Empty storage ──
-        let emptyEntry = CompressedEntry(
-            indices: device.makeBuffer(length: 4, options: .storageModeShared)!,
-            scales: device.makeBuffer(length: 4, options: .storageModeShared)!,
-            numVecs: 0
-        )
-        self.compressedKeys = Array(repeating: emptyEntry, count: numLayers)
-        self.compressedValues = Array(repeating: emptyEntry, count: numLayers)
+        // ── Pre-allocate scratch buffers for one step (numHeads vectors) ──
+        let bytesPerVecFP16 = headDim * 2                       // input: fp16
+        let bytesPerVecPacked = (headDim / 4) * 2               // output: packed uint16
+        let bytesPerVecScale = 2                                 // output: fp16 norm
 
-        kvqLogger.info("KVCacheQuantizer ready: \(numLayers) layers, \(numHeads) heads, \(headDim)d, 4-bit PolarQuant")
+        self.scratchInputBuffer = device.makeBuffer(
+            length: numHeads * bytesPerVecFP16, options: .storageModeShared
+        )!
+        self.scratchIndicesBuffer = device.makeBuffer(
+            length: numHeads * bytesPerVecPacked, options: .storageModeShared
+        )!
+        self.scratchScalesBuffer = device.makeBuffer(
+            length: numHeads * bytesPerVecScale, options: .storageModeShared
+        )!
+
+        // ── Empty storage ──
+        let emptyStore = CompressedStore(indicesData: Data(), scalesData: Data(), seqLen: 0)
+        self.compressedKeys = Array(repeating: emptyStore, count: numLayers)
+        self.compressedValues = Array(repeating: emptyStore, count: numLayers)
+
+        kvqLogger.info("KVCacheQuantizer ready: \(numLayers) layers, \(numHeads) heads, \(headDim)d, 4-bit incremental PolarQuant")
     }
 
     // MARK: - Public API
 
-    /// Compress a layer's KV cache from ORT `present` outputs.
-    func compress(layerIndex: Int, key: ORTValue, value: ORTValue) throws {
+    /// Extract and compress ONLY the new token position from this step's `present` output.
+    ///
+    /// The `present` tensor has shape [1, numHeads, seqLen, headDim] in fp16.
+    /// We extract the LAST position (index seqLen-1) across all heads, quantize those
+    /// `numHeads` vectors, and append to our growing compressed store.
+    ///
+    /// This ensures each position is quantized exactly ONCE — no compounding error.
+    func compressNewPosition(layerIndex: Int, key: ORTValue, value: ORTValue) throws {
         guard isEnabled else { return }
 
         let keyInfo = try key.tensorTypeAndShapeInfo()
         let seqLen = keyInfo.shape[2].intValue
-        let numVecs = numHeads * seqLen
 
+        // Extract last position's vectors from key and value
         let keyData = try key.tensorData() as Data
-        compressedKeys[layerIndex] = try quantizeOnGPU(fp16Data: keyData, numVecs: numVecs)
-
         let valData = try value.tensorData() as Data
-        compressedValues[layerIndex] = try quantizeOnGPU(fp16Data: valData, numVecs: numVecs)
+
+        let newKeyVecs = extractLastPosition(from: keyData, seqLen: seqLen)
+        let newValVecs = extractLastPosition(from: valData, seqLen: seqLen)
+
+        // Quantize the new vectors on GPU
+        let compressedKey = try quantizeVectors(newKeyVecs)
+        let compressedVal = try quantizeVectors(newValVecs)
+
+        // Append to growing store
+        compressedKeys[layerIndex].indicesData.append(compressedKey.indices)
+        compressedKeys[layerIndex].scalesData.append(compressedKey.scales)
+        compressedKeys[layerIndex].seqLen = seqLen
+
+        compressedValues[layerIndex].indicesData.append(compressedVal.indices)
+        compressedValues[layerIndex].scalesData.append(compressedVal.scales)
+        compressedValues[layerIndex].seqLen = seqLen
     }
 
-    /// Decompress a layer's key cache to fp16 ORTValue.
+    /// Decompress a layer's full key cache to fp16 ORTValue.
     func decompressKey(layerIndex: Int) throws -> ORTValue {
-        let entry = compressedKeys[layerIndex]
-        let fp16Data = try dequantizeOnGPU(entry: entry)
-        let seqLen = entry.numVecs / numHeads
+        let store = compressedKeys[layerIndex]
+        guard store.seqLen > 0 else {
+            return try makeEmptyKVTensor()
+        }
+        let fp16Data = try dequantizeStore(store: store)
         return try makeFloat16ORTValue(
             data: fp16Data,
-            shape: [1, NSNumber(value: numHeads), NSNumber(value: seqLen), NSNumber(value: headDim)]
+            shape: [1, NSNumber(value: numHeads), NSNumber(value: store.seqLen), NSNumber(value: headDim)]
         )
     }
 
-    /// Decompress a layer's value cache to fp16 ORTValue.
+    /// Decompress a layer's full value cache to fp16 ORTValue.
     func decompressValue(layerIndex: Int) throws -> ORTValue {
-        let entry = compressedValues[layerIndex]
-        let fp16Data = try dequantizeOnGPU(entry: entry)
-        let seqLen = entry.numVecs / numHeads
+        let store = compressedValues[layerIndex]
+        guard store.seqLen > 0 else {
+            return try makeEmptyKVTensor()
+        }
+        let fp16Data = try dequantizeStore(store: store)
         return try makeFloat16ORTValue(
             data: fp16Data,
-            shape: [1, NSNumber(value: numHeads), NSNumber(value: seqLen), NSNumber(value: headDim)]
+            shape: [1, NSNumber(value: numHeads), NSNumber(value: store.seqLen), NSNumber(value: headDim)]
         )
     }
 
     /// Reset all compressed storage (call between synthesis chunks).
     func reset() {
         for i in 0..<numLayers {
-            compressedKeys[i].numVecs = 0
-            compressedValues[i].numVecs = 0
+            compressedKeys[i] = CompressedStore(indicesData: Data(), scalesData: Data(), seqLen: 0)
+            compressedValues[i] = CompressedStore(indicesData: Data(), scalesData: Data(), seqLen: 0)
         }
         kvqLogger.debug("KV cache quantizer reset")
     }
@@ -215,11 +249,8 @@ final class KVCacheQuantizer {
     var compressedMemoryBytes: Int {
         var total = 0
         for i in 0..<numLayers {
-            // packed indices: numVecs * (headDim/4) * sizeof(uint16) = numVecs * 32
-            // scales: numVecs * sizeof(fp16) = numVecs * 2
-            let kVecs = compressedKeys[i].numVecs
-            let vVecs = compressedValues[i].numVecs
-            total += (kVecs + vVecs) * ((headDim / 4) * 2 + 2)
+            total += compressedKeys[i].indicesData.count + compressedKeys[i].scalesData.count
+            total += compressedValues[i].indicesData.count + compressedValues[i].scalesData.count
         }
         return total
     }
@@ -228,8 +259,8 @@ final class KVCacheQuantizer {
     var uncompressedEquivalentBytes: Int {
         var total = 0
         for i in 0..<numLayers {
-            let kVecs = compressedKeys[i].numVecs
-            let vVecs = compressedValues[i].numVecs
+            let kVecs = numHeads * compressedKeys[i].seqLen
+            let vVecs = numHeads * compressedValues[i].seqLen
             total += (kVecs + vVecs) * headDim * 2
         }
         return total
@@ -242,20 +273,43 @@ final class KVCacheQuantizer {
         return Double(uncompressedEquivalentBytes) / Double(compressed)
     }
 
-    // MARK: - Metal GPU Operations
+    // MARK: - Internal: Extract Last Position
 
-    private func quantizeOnGPU(fp16Data: Data, numVecs: Int) throws -> CompressedEntry {
-        let inputBuffer = device.makeBuffer(
-            bytes: (fp16Data as NSData).bytes,
-            length: fp16Data.count,
-            options: .storageModeShared
-        )!
+    /// Extract the last position (seqLen-1) from a KV tensor [1, numHeads, seqLen, headDim] fp16.
+    /// Returns `numHeads` vectors of `headDim` fp16 elements, laid out contiguously.
+    private func extractLastPosition(from tensorData: Data, seqLen: Int) -> Data {
+        // Tensor layout: [1, numHeads, seqLen, headDim]  in fp16
+        // For head h, position p: offset = (h * seqLen + p) * headDim * 2
+        let bytesPerVec = headDim * 2  // fp16
+        let lastPos = seqLen - 1
+        var result = Data(capacity: numHeads * bytesPerVec)
 
-        let packedSize = numVecs * (headDim / 4) * MemoryLayout<UInt16>.size
-        let scalesSize = numVecs * MemoryLayout<UInt16>.size  // fp16
+        tensorData.withUnsafeBytes { rawPtr in
+            let base = rawPtr.baseAddress!
+            for h in 0..<numHeads {
+                let offset = (h * seqLen + lastPos) * bytesPerVec
+                result.append(base.advanced(by: offset).assumingMemoryBound(to: UInt8.self), count: bytesPerVec)
+            }
+        }
 
-        let outputBuffer = device.makeBuffer(length: max(packedSize, 4), options: .storageModeShared)!
-        let scalesBuffer = device.makeBuffer(length: max(scalesSize, 4), options: .storageModeShared)!
+        return result
+    }
+
+    // MARK: - Internal: GPU Quantize (small batch)
+
+    private struct QuantizedChunk {
+        let indices: Data   // packed 4-bit
+        let scales: Data    // fp16 norms
+    }
+
+    /// Quantize `numHeads` vectors on Metal GPU.
+    private func quantizeVectors(_ fp16Data: Data) throws -> QuantizedChunk {
+        let numVecs = numHeads
+
+        // Copy input to scratch buffer
+        fp16Data.withUnsafeBytes { ptr in
+            memcpy(scratchInputBuffer.contents(), ptr.baseAddress!, fp16Data.count)
+        }
 
         guard let cmdBuffer = commandQueue.makeCommandBuffer(),
               let encoder = cmdBuffer.makeComputeCommandEncoder() else {
@@ -263,9 +317,9 @@ final class KVCacheQuantizer {
         }
 
         encoder.setComputePipelineState(quantizePSO)
-        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
-        encoder.setBuffer(outputBuffer, offset: 0, index: 1)
-        encoder.setBuffer(scalesBuffer, offset: 0, index: 2)
+        encoder.setBuffer(scratchInputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(scratchIndicesBuffer, offset: 0, index: 1)
+        encoder.setBuffer(scratchScalesBuffer, offset: 0, index: 2)
         encoder.setBuffer(rotationBuffer, offset: 0, index: 3)
         encoder.setBuffer(boundariesBuffer, offset: 0, index: 4)
 
@@ -275,7 +329,7 @@ final class KVCacheQuantizer {
         let tgWidth = min(quantizePSO.maxTotalThreadsPerThreadgroup, 256)
         encoder.dispatchThreads(
             MTLSize(width: numVecs, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(width: min(tgWidth, numVecs), height: 1, depth: 1)
         )
 
         encoder.endEncoding()
@@ -287,12 +341,34 @@ final class KVCacheQuantizer {
             throw KVQError.metalCommandFailed
         }
 
-        return CompressedEntry(indices: outputBuffer, scales: scalesBuffer, numVecs: numVecs)
+        // Read results
+        let indicesSize = numVecs * packedPerVec * MemoryLayout<UInt16>.size
+        let scalesSize = numVecs * MemoryLayout<UInt16>.size
+
+        let indicesData = Data(bytes: scratchIndicesBuffer.contents(), count: indicesSize)
+        let scalesData = Data(bytes: scratchScalesBuffer.contents(), count: scalesSize)
+
+        return QuantizedChunk(indices: indicesData, scales: scalesData)
     }
 
-    private func dequantizeOnGPU(entry: CompressedEntry) throws -> Data {
-        let numVecs = entry.numVecs
+    // MARK: - Internal: GPU Dequantize (full store)
+
+    /// Dequantize the entire compressed store back to fp16.
+    private func dequantizeStore(store: CompressedStore) throws -> Data {
+        let numVecs = numHeads * store.seqLen
         guard numVecs > 0 else { return Data() }
+
+        // Create GPU buffers from compressed data
+        let indicesBuffer = device.makeBuffer(
+            bytes: (store.indicesData as NSData).bytes,
+            length: store.indicesData.count,
+            options: .storageModeShared
+        )!
+        let scalesBuffer = device.makeBuffer(
+            bytes: (store.scalesData as NSData).bytes,
+            length: store.scalesData.count,
+            options: .storageModeShared
+        )!
 
         let outputSize = numVecs * headDim * MemoryLayout<UInt16>.size  // fp16
         let outputBuffer = device.makeBuffer(length: outputSize, options: .storageModeShared)!
@@ -303,10 +379,10 @@ final class KVCacheQuantizer {
         }
 
         encoder.setComputePipelineState(dequantizePSO)
-        encoder.setBuffer(entry.indices, offset: 0, index: 0)
-        encoder.setBuffer(entry.scales, offset: 0, index: 1)
+        encoder.setBuffer(indicesBuffer, offset: 0, index: 0)
+        encoder.setBuffer(scalesBuffer, offset: 0, index: 1)
         encoder.setBuffer(outputBuffer, offset: 0, index: 2)
-        encoder.setBuffer(rotationTBuffer, offset: 0, index: 3)  // R^T
+        encoder.setBuffer(rotationTBuffer, offset: 0, index: 3)
         encoder.setBuffer(centroidsBuffer, offset: 0, index: 4)
 
         var totalVecs = UInt32(numVecs)
@@ -327,7 +403,47 @@ final class KVCacheQuantizer {
             throw KVQError.metalCommandFailed
         }
 
-        return Data(bytes: outputBuffer.contents(), count: outputSize)
+        // The output is [numHeads * seqLen, headDim] in fp16, laid out as
+        // head0_pos0, head0_pos1, ..., head0_posN, head1_pos0, ...
+        // But ORT expects [1, numHeads, seqLen, headDim] which is the same layout.
+        // Wait — our compressed store appends per-step: [h0_p0, h1_p0, ..., h0_p1, h1_p1, ...]
+        // But ORT expects: [h0_p0, h0_p1, ..., h1_p0, h1_p1, ...]
+        // We need to transpose! Let's do it on CPU (it's just memory copies).
+
+        return transposeToORTLayout(
+            from: Data(bytes: outputBuffer.contents(), count: outputSize),
+            numHeads: numHeads,
+            seqLen: store.seqLen,
+            headDim: headDim
+        )
+    }
+
+    /// Transpose from append-order [step, head, headDim] to ORT order [head, step, headDim].
+    ///
+    /// Append order (how we stored it):  step0_head0, step0_head1, ..., step1_head0, ...
+    /// ORT order:                        head0_step0, head0_step1, ..., head1_step0, ...
+    private func transposeToORTLayout(from data: Data, numHeads: Int, seqLen: Int, headDim: Int) -> Data {
+        let bytesPerVec = headDim * 2  // fp16
+        var result = Data(count: data.count)
+
+        data.withUnsafeBytes { srcPtr in
+            result.withUnsafeMutableBytes { dstPtr in
+                let src = srcPtr.baseAddress!
+                let dst = dstPtr.baseAddress!
+
+                for step in 0..<seqLen {
+                    for head in 0..<numHeads {
+                        // Source: step * numHeads + head
+                        let srcOffset = (step * numHeads + head) * bytesPerVec
+                        // Dest: head * seqLen + step
+                        let dstOffset = (head * seqLen + step) * bytesPerVec
+                        memcpy(dst.advanced(by: dstOffset), src.advanced(by: srcOffset), bytesPerVec)
+                    }
+                }
+            }
+        }
+
+        return result
     }
 
     // MARK: - Helpers
@@ -335,6 +451,15 @@ final class KVCacheQuantizer {
     private func makeFloat16ORTValue(data: Data, shape: [NSNumber]) throws -> ORTValue {
         let mutableData = NSMutableData(data: data)
         return try ORTValue(tensorData: mutableData, elementType: .float16, shape: shape)
+    }
+
+    private func makeEmptyKVTensor() throws -> ORTValue {
+        let emptyData = NSMutableData()
+        return try ORTValue(
+            tensorData: emptyData,
+            elementType: .float16,
+            shape: [1, NSNumber(value: numHeads), 0, NSNumber(value: headDim)]
+        )
     }
 
     // MARK: - Constants Loading
@@ -354,7 +479,6 @@ final class KVCacheQuantizer {
             throw KVQError.constantsNotFound
         }
 
-        // Convert Double arrays from JSON to Float arrays
         guard let rotMatrix = json["rotation_matrix"] as? [Double],
               let bounds = json["quantizer_boundaries"] as? [Double],
               let cents = json["quantizer_centroids"] as? [Double] else {
