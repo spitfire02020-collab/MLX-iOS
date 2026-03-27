@@ -169,6 +169,14 @@ final class ChatterboxEngine: ObservableObject {
     /// Metal device for GPU inference. Cached for reuse across pipeline calls.
     private var metalDevice: MTLDevice?
 
+    // === PolarQuant KV Cache Compression ===
+    /// Feature flag: compress KV cache to 4-bit between decode steps.
+    /// Reduces KV memory ~3.6x via Metal GPU. Falls back to fp16 if Metal unavailable.
+    private let usePolarQuantKV: Bool = true
+
+    /// PolarQuant KV cache compressor — nil until first use (lazy init needs numLayers).
+    private var kvCacheQuantizer: KVCacheQuantizer?
+
     // Holds all relevant speech encoder outputs.
     // audio_features is used as a prefix in inputs_embeds for the language model
     // to condition voice style. speaker_embeddings + speaker_features go to the
@@ -869,6 +877,9 @@ final class ChatterboxEngine: ObservableObject {
             throw ChatterboxError.modelNotLoaded
         }
 
+        // Reset PolarQuant compressed KV cache for this chunk
+        kvCacheQuantizer?.reset()
+
         // Apply exaggeration + cfg_weight: scale audio features ───────────────
         // Combine both parameters into a single scaling factor:
         // - exaggeration: controls emotional intensity (0.25-2.0)
@@ -971,6 +982,20 @@ final class ChatterboxEngine: ObservableObject {
         let numLayers = lmInputNames.filter {
             $0.hasPrefix("past_key_values.") && $0.hasSuffix(".key")
         }.count
+
+        // ── Lazy-init PolarQuant KV cache quantizer (needs numLayers) ─────────
+        if usePolarQuantKV && kvCacheQuantizer == nil {
+            do {
+                kvCacheQuantizer = try KVCacheQuantizer(
+                    numLayers: numLayers,
+                    numHeads: config.numKVHeads,
+                    headDim: config.headDim
+                )
+                chatterboxLogger.info("PolarQuant KV cache quantizer initialized (\(numLayers) layers)")
+            } catch {
+                chatterboxLogger.warning("PolarQuant init failed, using fp16 pass-through: \(error)")
+            }
+        }
 
         // ── Build prefill inputs ───────────────────────────────────────────────
         var lmInputs: [String: ORTValue] = [:]
@@ -1148,15 +1173,37 @@ final class ChatterboxEngine: ObservableObject {
                     )
                 ]
 
-                // Carry KV-cache forward:
-                //   LM output: present.{layer}.key/value
-                //   LM input:  past_key_values.{layer}.key/value
-                for layer in 0..<numLayers {
-                    if let kv = lmOutputs["present.\(layer).key"] {
-                        nextStepInputs["past_key_values.\(layer).key"] = kv
+                // Carry KV-cache forward, optionally compressing via PolarQuant.
+                // When enabled, KV cache is stored at 4-bit between steps (~3.6x smaller).
+                if let quantizer = self.kvCacheQuantizer, quantizer.isEnabled {
+                    // Compress this step's full KV cache on Metal GPU
+                    for layer in 0..<numLayers {
+                        if let key = lmOutputs["present.\(layer).key"],
+                           let val = lmOutputs["present.\(layer).value"] {
+                            try quantizer.compress(layerIndex: layer, key: key, value: val)
+                        }
                     }
-                    if let kv = lmOutputs["present.\(layer).value"] {
-                        nextStepInputs["past_key_values.\(layer).value"] = kv
+                    // Decompress for next step's input (fp16 ORTValues)
+                    for layer in 0..<numLayers {
+                        nextStepInputs["past_key_values.\(layer).key"] = try quantizer.decompressKey(layerIndex: layer)
+                        nextStepInputs["past_key_values.\(layer).value"] = try quantizer.decompressValue(layerIndex: layer)
+                    }
+
+                    // Log compression stats every 100 steps
+                    if step % 100 == 0 {
+                        let ratio = quantizer.compressionRatio
+                        let compressedKB = quantizer.compressedMemoryBytes / 1024
+                        chatterboxLogger.info("KV step \(step): \(compressedKB)KB (\(String(format: "%.1f", ratio))x compression)")
+                    }
+                } else {
+                    // Original fp16 pass-through
+                    for layer in 0..<numLayers {
+                        if let kv = lmOutputs["present.\(layer).key"] {
+                            nextStepInputs["past_key_values.\(layer).key"] = kv
+                        }
+                        if let kv = lmOutputs["present.\(layer).value"] {
+                            nextStepInputs["past_key_values.\(layer).value"] = kv
+                        }
                     }
                 }
                 // lmOutputs goes out of scope here; autoreleasepool drains ORT's

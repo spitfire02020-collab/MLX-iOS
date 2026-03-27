@@ -52,6 +52,9 @@
 		E82E1FAEA3609F64C98EF0A5 /* ServiceContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CF5A1D5C6BB64503D7E4EBF /* ServiceContainer.swift */; };
 		E93D736C29808207D47DCE64 /* default_voice.wav in Resources */ = {isa = PBXBuildFile; fileRef = 4A6D8EC036C82852FD4ED0CF /* default_voice.wav */; };
 		ECA5E0E3D07978F6D54832B3 /* LibraryItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B9DEE2C033CD96D4CCEE412 /* LibraryItem.swift */; };
+		AA1B2C3D4E5F6A7B8C9D0E1F /* KVCacheQuantizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB2C3D4E5F6A7B8C9D0E1F2A /* KVCacheQuantizer.swift */; };
+		CC3D4E5F6A7B8C9D0E1F2A3B /* PolarQuantKernels.metal in Sources */ = {isa = PBXBuildFile; fileRef = DD4E5F6A7B8C9D0E1F2A3B4C /* PolarQuantKernels.metal */; };
+		EE5F6A7B8C9D0E1F2A3B4C5D /* polarquant_constants.json in Resources */ = {isa = PBXBuildFile; fileRef = FF6A7B8C9D0E1F2A3B4C5D6E /* polarquant_constants.json */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -112,6 +115,9 @@
 		EAEE67288ED13F903EEAC7B8 /* Color+Extensions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Color+Extensions.swift"; sourceTree = "<group>"; };
 		EE27603BA268CDF23C5A6DC0 /* MiniPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiniPlayerView.swift; sourceTree = "<group>"; };
 		F8712B5068E891079DC2E31D /* AddContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddContentView.swift; sourceTree = "<group>"; };
+		BB2C3D4E5F6A7B8C9D0E1F2A /* KVCacheQuantizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KVCacheQuantizer.swift; sourceTree = "<group>"; };
+		DD4E5F6A7B8C9D0E1F2A3B4C /* PolarQuantKernels.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = PolarQuantKernels.metal; sourceTree = "<group>"; };
+		FF6A7B8C9D0E1F2A3B4C5D6E /* polarquant_constants.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = polarquant_constants.json; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -133,6 +139,7 @@
 			children = (
 				0F12580582B61E83294531E6 /* Assets.xcassets */,
 				3D1C33856CCB7D9770CB177C /* ChatterboxModels */,
+				FF6A7B8C9D0E1F2A3B4C5D6E /* polarquant_constants.json */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -197,6 +204,7 @@
 				998DEEE41B2B069602B732FB /* AudioPlayerService.swift */,
 				BFCD7FE661A4214FA2CFB3FE /* BookParser.swift */,
 				96367034206E129C51F09C14 /* ChatterboxEngine.swift */,
+				AA7B8C9D0E1F2A3B4C5D6E7F /* Metal */,
 				BC6E6E74FA806E8B4D80B03D /* ModelDownloadService.swift */,
 				7F6C5F6D8D708F8417D1B670 /* ONNXGraphFixer.swift */,
 				0CF5A1D5C6BB64503D7E4EBF /* ServiceContainer.swift */,
@@ -207,6 +215,15 @@
 				3D7ABAE630EFCCC5AA154642 /* WebContentExtractor.swift */,
 			);
 			path = Services;
+			sourceTree = "<group>";
+		};
+		AA7B8C9D0E1F2A3B4C5D6E7F /* Metal */ = {
+			isa = PBXGroup;
+			children = (
+				BB2C3D4E5F6A7B8C9D0E1F2A /* KVCacheQuantizer.swift */,
+				DD4E5F6A7B8C9D0E1F2A3B4C /* PolarQuantKernels.metal */,
+			);
+			path = Metal;
 			sourceTree = "<group>";
 		};
 		4A5EB70565E8F1D9FF36E6B8 /* ViewModels */ = {
@@ -380,6 +397,7 @@
 				745A589F7CD02CFD3A76D775 /* Emily.wav in Resources */,
 				8AC1726ED465942DCE31C1C0 /* Henry.wav in Resources */,
 				9C12E45A6280921DD6882E4E /* Jade.wav in Resources */,
+				EE5F6A7B8C9D0E1F2A3B4C5D /* polarquant_constants.json in Resources */,
 				91E3147D122EF81518168B45 /* conditional_decoder_q4f16_merged.onnx in Resources */,
 				E93D736C29808207D47DCE64 /* default_voice.wav in Resources */,
 				515A6F013D20A426D3EDA94F /* embed_tokens_q4f16_merged.onnx in Resources */,
@@ -424,6 +442,8 @@
 				A78BACED94D81E75AEDF9249 /* VoiceSelectionView.swift in Sources */,
 				346E0B49B8EAA8A6827408A8 /* WaveformView.swift in Sources */,
 				939A3D49B6AA379EEA8435C5 /* WebContentExtractor.swift in Sources */,
+				AA1B2C3D4E5F6A7B8C9D0E1F /* KVCacheQuantizer.swift in Sources */,
+				CC3D4E5F6A7B8C9D0E1F2A3B /* PolarQuantKernels.metal in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
