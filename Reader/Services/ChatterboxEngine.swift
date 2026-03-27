@@ -95,6 +95,11 @@ struct ChatterboxConfig {
     let maxNewTokens: Int = 1500  // Sufficient for longer sentence chunks
     let repetitionPenalty: Float = 1.2  // Match Python reference exactly
 
+    /// Number of initial decode steps to keep KV cache in full fp16 precision
+    /// before TurboQuant quantization begins. Preserves accuracy for early,
+    /// heavily-attended positions. Set to 0 to disable warmup.
+    let turboQuantWarmupSteps: Int = 8
+
     // Generation parameters (matching server API)
     var seed: Int = 0                          // 0 = random, non-zero = reproducible
     var exaggeration: Float = 0.5              // 0.25-2.0, controls expressiveness
@@ -169,12 +174,13 @@ final class ChatterboxEngine: ObservableObject {
     /// Metal device for GPU inference. Cached for reuse across pipeline calls.
     private var metalDevice: MTLDevice?
 
-    // === PolarQuant KV Cache Compression ===
-    /// Feature flag: compress KV cache to 4-bit between decode steps.
-    /// Reduces KV memory ~3.6x via Metal GPU. Falls back to fp16 if Metal unavailable.
+    // === TurboQuant KV Cache Compression ===
+    /// Feature flag: compress KV cache using TurboQuant (PolarQuant 4-bit + QJL 1-bit)
+    /// between decode steps. Reduces KV memory ~3x via Metal GPU with delayed
+    /// quantization warmup. Falls back to fp16 if Metal unavailable.
     private let usePolarQuantKV: Bool = true
 
-    /// PolarQuant KV cache compressor — nil until first use (lazy init needs numLayers).
+    /// TurboQuant KV cache compressor — nil until first use (lazy init needs numLayers).
     private var kvCacheQuantizer: KVCacheQuantizer?
 
     // Holds all relevant speech encoder outputs.
@@ -877,7 +883,7 @@ final class ChatterboxEngine: ObservableObject {
             throw ChatterboxError.modelNotLoaded
         }
 
-        // Reset PolarQuant compressed KV cache for this chunk
+        // Reset TurboQuant compressed KV cache for this chunk
         kvCacheQuantizer?.reset()
 
         // Apply exaggeration + cfg_weight: scale audio features ───────────────
@@ -983,17 +989,18 @@ final class ChatterboxEngine: ObservableObject {
             $0.hasPrefix("past_key_values.") && $0.hasSuffix(".key")
         }.count
 
-        // ── Lazy-init PolarQuant KV cache quantizer (needs numLayers) ─────────
+        // ── Lazy-init TurboQuant KV cache quantizer (needs numLayers) ─────────
         if usePolarQuantKV && kvCacheQuantizer == nil {
             do {
                 kvCacheQuantizer = try KVCacheQuantizer(
                     numLayers: numLayers,
                     numHeads: config.numKVHeads,
-                    headDim: config.headDim
+                    headDim: config.headDim,
+                    warmupSteps: config.turboQuantWarmupSteps
                 )
-                chatterboxLogger.info("PolarQuant KV cache quantizer initialized (\(numLayers) layers)")
+                chatterboxLogger.info("TurboQuant KV cache quantizer initialized (\(numLayers) layers, warmup=\(config.turboQuantWarmupSteps))")
             } catch {
-                chatterboxLogger.warning("PolarQuant init failed, using fp16 pass-through: \(error)")
+                chatterboxLogger.warning("TurboQuant init failed, using fp16 pass-through: \(error)")
             }
         }
 
@@ -1173,87 +1180,66 @@ final class ChatterboxEngine: ObservableObject {
                     )
                 ]
 
-                // Carry KV-cache forward, optionally compressing via PolarQuant.
-                // INCREMENTAL: only quantize the NEW position each step (no compounding error).
+                // Carry KV-cache forward using TurboQuant with delayed quantization.
+                // - During warmup (first N steps): pass full present as fp16 (lossless)
+                // - At warmup boundary: bootstrap quantizer with ALL accumulated positions
+                // - After warmup: incrementally quantize new positions with PolarQuant + QJL
                 if let quantizer = self.kvCacheQuantizer, quantizer.isEnabled {
-                    // Quantize ONLY the new token's KV vectors (last position in present)
-                    for layer in 0..<numLayers {
-                        if let key = lmOutputs["present.\(layer).key"],
-                           let val = lmOutputs["present.\(layer).value"] {
-                            try quantizer.compressNewPosition(layerIndex: layer, key: key, value: val)
-                        }
-                    }
-                    // Decompress full cache from single-quantized store
-                    for layer in 0..<numLayers {
-                        let decompressedKey = try quantizer.decompressKey(layerIndex: layer)
-                        let decompressedValue = try quantizer.decompressValue(layerIndex: layer)
-                        nextStepInputs["past_key_values.\(layer).key"] = decompressedKey
-                        nextStepInputs["past_key_values.\(layer).value"] = decompressedValue
-
-                        // DIAGNOSTIC: Log decompressed KV bytes directly from engine (bypasses KVCacheQuantizer logger)
-                        // decompressKey is called at the START of each decode step, so 'step' here is the step
-                        // whose compressed KV we're decompressing. Repetition DETECTED at step 38, but corruption
-                        // likely starts ~6 steps earlier (REPETITION DETECTED checks 6 tokens back).
-                        if step >= 32 && step <= 48 && layer == 0 {
-                            if let keyData = try? decompressedKey.tensorData() as Data,
-                               let valData = try? decompressedValue.tensorData() as Data {
-                                // Check for NaN/Inf in more fp16 values (first 16 vectors = 16 * 64 = 1024 bytes)
-                                var keyNanCount = 0
-                                var keyZeroCount = 0
-                                var keyInfCount = 0
-                                let keySlice = keyData.prefix(1024)
-                                keySlice.withUnsafeBytes { ptr in
-                                    let buf = ptr.bindMemory(to: UInt16.self)
-                                    for i in 0..<min(buf.count, 512) {
-                                        let exp = (buf[i] & 0x7C00) >> 10
-                                        if exp == 31 { keyInfCount += 1 }  // Infinity
-                                        if exp == 31 && (buf[i] & 0x03FF) != 0 { keyNanCount += 1 }  // NaN
-                                        if buf[i] == 0 { keyZeroCount += 1 }
-                                    }
-                                }
-                                var valNanCount = 0
-                                var valZeroCount = 0
-                                var valInfCount = 0
-                                let valSlice = valData.prefix(1024)
-                                valSlice.withUnsafeBytes { ptr in
-                                    let buf = ptr.bindMemory(to: UInt16.self)
-                                    for i in 0..<min(buf.count, 512) {
-                                        let exp = (buf[i] & 0x7C00) >> 10
-                                        if exp == 31 { valInfCount += 1 }  // Infinity
-                                        if exp == 31 && (buf[i] & 0x03FF) != 0 { valNanCount += 1 }  // NaN
-                                        if buf[i] == 0 { valZeroCount += 1 }
-                                    }
-                                }
-                                let keyInfo = (try? decompressedKey.tensorTypeAndShapeInfo())?.shape ?? []
-                                let valInfo = (try? decompressedValue.tensorTypeAndShapeInfo())?.shape ?? []
-                                // Show actual fp16 bytes as UInt16 hex for first 4 values (head 0, step 0)
-                                var keyFirst4: [String] = []
-                                var valFirst4: [String] = []
-                                keyData.prefix(8).withUnsafeBytes { ptr in
-                                    let buf = ptr.bindMemory(to: UInt16.self)
-                                    for i in 0..<min(buf.count, 4) {
-                                        keyFirst4.append(String(format: "0x%04X", buf[i]))
-                                    }
-                                }
-                                valData.prefix(8).withUnsafeBytes { ptr in
-                                    let buf = ptr.bindMemory(to: UInt16.self)
-                                    for i in 0..<min(buf.count, 4) {
-                                        valFirst4.append(String(format: "0x%04X", buf[i]))
-                                    }
-                                }
-                                // Expected bytes: 1 * 16 * seqLen * 64 * 2 = 32 * seqLen
-                                let seqLen = keyInfo.count >= 3 ? keyInfo[2].intValue : 0
-                                let expectedBytes = 32 * seqLen
-                                chatterboxLogger.warning("PQ_ENGINE_DECOMPRESS step=\(step) layer=0 keyShape=\(keyInfo) keyBytes=\(keyData.count)/exp\(expectedBytes) keyNaN=\(keyNanCount) keyInf=\(keyInfCount) keyZero=\(keyZeroCount) valShape=\(valInfo) valBytes=\(valData.count) valNaN=\(valNanCount) valInf=\(valInfCount) valZero=\(valZeroCount) keyFirst4=\(keyFirst4) valFirst4=\(valFirst4)")
+                    if quantizer.scheduler.isInWarmup {
+                        // WARMUP: pass full present directly (fp16, no compression)
+                        for layer in 0..<numLayers {
+                            if let kv = lmOutputs["present.\(layer).key"] {
+                                nextStepInputs["past_key_values.\(layer).key"] = kv
+                            }
+                            if let kv = lmOutputs["present.\(layer).value"] {
+                                nextStepInputs["past_key_values.\(layer).value"] = kv
                             }
                         }
+                        quantizer.scheduler.advanceStep()
+
+                        if step < 3 || step == config.turboQuantWarmupSteps - 1 {
+                            chatterboxLogger.debug("TurboQuant warmup step \(step)/\(config.turboQuantWarmupSteps) (fp16 pass-through)")
+                        }
+                    } else if quantizer.scheduler.isTransitionStep {
+                        // TRANSITION: bootstrap quantizer with full present (all accumulated positions)
+                        chatterboxLogger.info("TurboQuant transition at step \(step): bootstrapping from full KV cache")
+                        for layer in 0..<numLayers {
+                            if let key = lmOutputs["present.\(layer).key"],
+                               let val = lmOutputs["present.\(layer).value"] {
+                                try quantizer.bootstrapFromFullPresent(layerIndex: layer, key: key, value: val)
+                            }
+                        }
+                        // Decompress full cache from quantized store
+                        for layer in 0..<numLayers {
+                            let decompressedKey = try quantizer.decompressKey(layerIndex: layer)
+                            let decompressedValue = try quantizer.decompressValue(layerIndex: layer)
+                            nextStepInputs["past_key_values.\(layer).key"] = decompressedKey
+                            nextStepInputs["past_key_values.\(layer).value"] = decompressedValue
+                        }
+                        quantizer.scheduler.advanceStep()
+                    } else {
+                        // POST-WARMUP: incrementally quantize ONLY the new position each step
+                        for layer in 0..<numLayers {
+                            if let key = lmOutputs["present.\(layer).key"],
+                               let val = lmOutputs["present.\(layer).value"] {
+                                try quantizer.compressNewPosition(layerIndex: layer, key: key, value: val)
+                            }
+                        }
+                        // Decompress full cache from TurboQuant store
+                        for layer in 0..<numLayers {
+                            let decompressedKey = try quantizer.decompressKey(layerIndex: layer)
+                            let decompressedValue = try quantizer.decompressValue(layerIndex: layer)
+                            nextStepInputs["past_key_values.\(layer).key"] = decompressedKey
+                            nextStepInputs["past_key_values.\(layer).value"] = decompressedValue
+                        }
+                        quantizer.scheduler.advanceStep()
                     }
 
                     // Log compression stats every 100 steps
-                    if step % 100 == 0 {
+                    if step % 100 == 0 && !quantizer.scheduler.isInWarmup {
                         let ratio = quantizer.compressionRatio
                         let compressedKB = quantizer.compressedMemoryBytes / 1024
-                        chatterboxLogger.info("KV step \(step): \(compressedKB)KB (\(String(format: "%.1f", ratio))x compression)")
+                        chatterboxLogger.info("TurboQuant step \(step): \(compressedKB)KB (\(String(format: "%.1f", ratio))x compression)")
                     }
                 } else {
                     // Original fp16 pass-through
