@@ -97,12 +97,11 @@ enum KVQError: Error, LocalizedError {
 /// **Incremental** quantization: each KV position is quantized exactly ONCE when
 /// it first appears, avoiding compounding quantization error.
 ///
-/// Memory layout per layer:
-///   - warmup fp16:     raw fp16 vectors for first warmupSteps positions (append-order)
-///   - packed indices:  growing buffer of 4-bit packed uint16 (post-warmup, append-order)
-///   - scales:          growing buffer of fp16 per-vector norms (post-warmup, append-order)
-///   - QJL sign bits:   1-bit residual direction per dimension (8 bytes/vec, post-warmup)
-///   - QJL magnitudes:  fp16 mean residual magnitude per vector (post-warmup)
+/// Memory layout per layer (after warmup transition):
+///   - packed indices:  growing buffer of 4-bit packed uint16 (append-order)
+///   - scales:          growing buffer of fp16 per-vector norms (append-order)
+///   - QJL sign bits:   1-bit residual direction per dimension (8 bytes/vec)
+///   - QJL magnitudes:  fp16 mean residual magnitude per vector
 final class KVCacheQuantizer {
 
     // MARK: - Metal State
@@ -139,25 +138,22 @@ final class KVCacheQuantizer {
 
     // MARK: - Compressed Storage
 
-    /// Per-layer compressed store with warmup (fp16) and quantized (TurboQuant) regions.
+    /// Per-layer compressed store using TurboQuant (PolarQuant + QJL).
+    ///
+    /// During warmup, the engine passes present tensors directly (fp16 pass-through)
+    /// without involving the quantizer. At the warmup-to-quantized transition, the
+    /// engine calls `bootstrapFromFullPresent` to quantize ALL accumulated positions.
+    /// Subsequent steps call `compressNewPosition` to add one position at a time.
     private struct CompressedStore {
-        // Warmup: raw fp16 in append-order [warmupVecCount * headDim * 2 bytes]
-        var warmupData: Data
-        var warmupPositions: Int     // Number of sequence positions in warmup
-
-        // Quantized: PolarQuant + QJL compressed (post-warmup, append-order)
+        // Quantized: PolarQuant + QJL compressed (append-order)
         var indicesData: Data        // packed 4-bit uint16
         var scalesData: Data         // per-vector norm fp16
         var qjlSignBits: Data        // 1-bit residual signs [quantizedVecCount * 8 bytes]
         var qjlMagnitudes: Data      // fp16 mean residual magnitude
         var quantizedPositions: Int  // Number of sequence positions quantized
 
-        // Warmup positions include the full present tensor from the first decode step.
-        // totalSeqLen = number of positions in the warmup snapshot + additional warmup
-        // decode steps + quantized decode steps.
-
-        /// Total number of vectors per head in this store.
-        var totalSeqLen: Int { warmupPositions + quantizedPositions }
+        /// Total number of positions per head in this store.
+        var totalSeqLen: Int { quantizedPositions }
     }
 
     private var compressedKeys: [CompressedStore]
@@ -269,7 +265,6 @@ final class KVCacheQuantizer {
 
         // ── Empty storage ──
         let emptyStore = CompressedStore(
-            warmupData: Data(), warmupPositions: 0,
             indicesData: Data(), scalesData: Data(),
             qjlSignBits: Data(), qjlMagnitudes: Data(),
             quantizedPositions: 0
@@ -285,11 +280,13 @@ final class KVCacheQuantizer {
     // Track step count for diagnostic logging (per-layer calls, not decode steps)
     private var stepCount: Int = 0
 
-    /// Bootstrap the quantizer by storing ALL positions from a full `present` tensor.
+    /// Bootstrap the quantizer by quantizing ALL positions from a full `present` tensor.
     ///
-    /// Called at the transition from warmup to quantized mode. Quantizes every position
-    /// in the tensor (the entire KV cache accumulated so far) and stores them.
-    /// After this call, subsequent `compressNewPosition` calls add one position at a time.
+    /// Called at the transition from warmup to quantized mode. The engine has been
+    /// passing present tensors directly (fp16) during warmup. At the transition point,
+    /// this method quantizes every position in the current full KV cache tensor using
+    /// TurboQuant (PolarQuant + QJL) and stores them. After this call, subsequent
+    /// `compressNewPosition` calls add one position at a time.
     func bootstrapFromFullPresent(layerIndex: Int, key: ORTValue, value: ORTValue) throws {
         guard isEnabled else { return }
 
@@ -397,7 +394,6 @@ final class KVCacheQuantizer {
     /// Reset all compressed storage (call between synthesis chunks).
     func reset() {
         let emptyStore = CompressedStore(
-            warmupData: Data(), warmupPositions: 0,
             indicesData: Data(), scalesData: Data(),
             qjlSignBits: Data(), qjlMagnitudes: Data(),
             quantizedPositions: 0
@@ -413,12 +409,10 @@ final class KVCacheQuantizer {
 
     // MARK: - Memory Stats
 
-    /// Current compressed KV cache memory (bytes), including warmup fp16 + quantized data.
+    /// Current compressed KV cache memory (bytes).
     var compressedMemoryBytes: Int {
         var total = 0
         for i in 0..<numLayers {
-            // Warmup (raw fp16)
-            total += compressedKeys[i].warmupData.count + compressedValues[i].warmupData.count
             // Quantized (PolarQuant indices + scales + QJL signs + magnitudes)
             total += compressedKeys[i].indicesData.count + compressedKeys[i].scalesData.count
             total += compressedKeys[i].qjlSignBits.count + compressedKeys[i].qjlMagnitudes.count
@@ -467,25 +461,6 @@ final class KVCacheQuantizer {
             for h in 0..<numHeads {
                 let offset = (h * seqLen + position) * bytesPerVec
                 result.append(base.advanced(by: offset).assumingMemoryBound(to: UInt8.self), count: bytesPerVec)
-            }
-        }
-
-        return result
-    }
-
-    /// Extract ALL positions from a KV tensor [1, numHeads, seqLen, headDim] fp16.
-    /// Returns data in append-order: [step0_h0, step0_h1, ..., step1_h0, step1_h1, ...].
-    private func extractAllPositionsToAppendOrder(from tensorData: Data, seqLen: Int) -> Data {
-        let bytesPerVec = headDim * 2  // fp16
-        var result = Data(capacity: seqLen * numHeads * bytesPerVec)
-
-        tensorData.withUnsafeBytes { rawPtr in
-            let base = rawPtr.baseAddress!
-            for s in 0..<seqLen {
-                for h in 0..<numHeads {
-                    let ortOffset = (h * seqLen + s) * bytesPerVec
-                    result.append(base.advanced(by: ortOffset).assumingMemoryBound(to: UInt8.self), count: bytesPerVec)
-                }
             }
         }
 
@@ -658,59 +633,15 @@ final class KVCacheQuantizer {
         return Data(bytes: outputBuffer.contents(), count: outputSize)
     }
 
-    // MARK: - Internal: Combined Decompression
+    // MARK: - Internal: Decompression
 
-    /// Decompress a store by combining warmup fp16 data with dequantized quantized data.
+    /// Decompress a store by dequantizing TurboQuant data and transposing to ORT-order.
     /// Returns fp16 data in ORT-order [numHeads, totalSeqLen, headDim].
     private func decompressStore(store: CompressedStore) throws -> Data {
-        let bytesPerVec = headDim * 2  // fp16
-        let totalSeqLen = store.totalSeqLen
-        let totalBytes = numHeads * totalSeqLen * bytesPerVec
+        guard store.quantizedPositions > 0 else { return Data() }
 
-        // Case 1: Only warmup data (no quantized positions yet)
-        if store.quantizedPositions == 0 && store.warmupPositions > 0 {
-            return transposeAppendToORT(appendData: store.warmupData, numPositions: store.warmupPositions)
-        }
-
-        // Case 2: Only quantized data (no warmup, e.g., warmupSteps=0 or after bootstrap)
-        if store.warmupPositions == 0 && store.quantizedPositions > 0 {
-            let appendOrderData = try turboDequantizeStore(store: store)
-            return transposeAppendToORT(appendData: appendOrderData, numPositions: store.quantizedPositions)
-        }
-
-        // Case 3: Both warmup and quantized data — combine per-head
-        let warmupORT = transposeAppendToORT(appendData: store.warmupData, numPositions: store.warmupPositions)
-        let quantizedAppend = try turboDequantizeStore(store: store)
-        let quantizedORT = transposeAppendToORT(appendData: quantizedAppend, numPositions: store.quantizedPositions)
-
-        // Interleave per-head: for each head, warmup positions then quantized positions
-        var combined = Data(count: totalBytes)
-        let warmupBytesPerHead = store.warmupPositions * bytesPerVec
-        let quantizedBytesPerHead = store.quantizedPositions * bytesPerVec
-        let combinedBytesPerHead = totalSeqLen * bytesPerVec
-
-        warmupORT.withUnsafeBytes { warmupSrc in
-            quantizedORT.withUnsafeBytes { quantSrc in
-                combined.withUnsafeMutableBytes { dst in
-                    for h in 0..<numHeads {
-                        // Copy warmup positions for this head
-                        memcpy(
-                            dst.baseAddress!.advanced(by: h * combinedBytesPerHead),
-                            warmupSrc.baseAddress!.advanced(by: h * warmupBytesPerHead),
-                            warmupBytesPerHead
-                        )
-                        // Copy quantized positions for this head
-                        memcpy(
-                            dst.baseAddress!.advanced(by: h * combinedBytesPerHead + warmupBytesPerHead),
-                            quantSrc.baseAddress!.advanced(by: h * quantizedBytesPerHead),
-                            quantizedBytesPerHead
-                        )
-                    }
-                }
-            }
-        }
-
-        return combined
+        let appendOrderData = try turboDequantizeStore(store: store)
+        return transposeAppendToORT(appendData: appendOrderData, numPositions: store.quantizedPositions)
     }
 
     // MARK: - Helpers
